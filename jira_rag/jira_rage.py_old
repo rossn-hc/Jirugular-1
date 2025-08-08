@@ -1,0 +1,135 @@
+#!/usr/bin/env python
+"""app.py – Interactive console UI for *jira_rag* (now with a dependency helper).
+
+Run:
+    python -m jira_rag.app
+
+Menu
+====
+1. **Crawl / rebuild index**
+2. **Chat** (multi‑turn)
+3. **Show dependencies for an issue**
+4. **Quit**
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+from typing import List
+
+from .config import JIRA_URL, JIRA_USERNAME, JIRA_PASSWORD, log
+from .crawler import JiraCrawler
+from .jira_client import JiraClient
+from .vector_store import FaissIndexer
+from .embedder import Embedder
+from .chat import ChatService
+from .models import IssueNode
+
+
+STEM = "jira_vectors"
+
+
+def crawl_and_build(jql: str = "") -> None:
+    client = JiraClient(JIRA_URL, JIRA_USERNAME, JIRA_PASSWORD, verify_ssl=False)
+    crawler = JiraCrawler(client)
+    nodes = crawler.crawl(jql_scope=jql)
+
+    embedder = Embedder()
+    idx = FaissIndexer(dim=embedder.dim, stem=STEM)
+    idx.add(embedder.encode([n.to_document() for n in nodes]), [n.to_metadata() for n in nodes])
+    idx.save()
+    log.info("Crawl + embed complete → %s vectors", len(nodes))
+
+
+def ask_question(question: str, *, top: int = 5) -> None:
+    embedder = Embedder()
+    idx = FaissIndexer(dim=embedder.dim, stem=STEM)
+    try:
+        idx.load()
+    except FileNotFoundError:
+        print("Index not found. Run crawl first.")
+        return
+    chat = ChatService(idx, embedder)
+    res = chat.answer(question, top_k=top)
+    print("\n>>>", res["answer"], "\n")
+    if res["sources"]:
+        print("Sources:")
+        for s in res["sources"]:
+            print(f"• {s['key']} (score {s['score']:.2f})")
+    print()
+
+
+def show_dependencies(issue_key: str) -> None:
+    embedder = Embedder()
+    idx = FaissIndexer(dim=embedder.dim, stem=STEM)
+    try:
+        idx.load()
+    except FileNotFoundError:
+        print("Index not found. Run crawl first.")
+        return
+
+    # Build a map key->metadata
+    meta_map = {m["key"]: m for m in idx.meta}
+    issue = meta_map.get(issue_key.upper())
+    if not issue:
+        print(f"Issue {issue_key} not found in index.")
+        return
+    deps = issue.get("dependencies", []) or []
+    if not deps:
+        print(f"Issue {issue_key} has no recorded dependencies.")
+        return
+    print(f"Dependencies for {issue_key}:")
+    for d in deps:
+        arrow = "→" if d["direction"] == "outward" else "←"
+        print(f" {arrow} {d['key']} ({d['type']})")
+    print()
+
+
+MENU = (
+    "Jira‑RAG Interactive\n"
+    "────────────────────\n"
+    "1) Crawl / rebuild index\n"
+    "2) Chat (multi‑turn)\n"
+    "3) Show dependencies for an issue\n"
+    "4) Quit\n"
+)
+
+
+def menu() -> None:
+    while True:
+        print(MENU, flush=True)
+        choice = input(" > ").strip()
+        if choice == "1":
+            jql = input("Optional JQL filter (blank for all): ").strip()
+            crawl_and_build(jql)
+            continue
+        elif choice == "2":
+            print("Enter questions (blank or 'q' to return).")
+            while True:
+                q = input("Q> ").strip()
+                if q == "" or q.lower() in {"q", "quit", "exit", "back"}:
+                    break
+                ask_question(q)
+            continue
+        elif choice == "3":
+            key = input("Issue key: ").strip()
+            if key:
+                show_dependencies(key)
+            continue
+        elif choice == "4":
+            print("Goodbye!")
+            break
+        else:
+            print("Invalid selection. Try again.")
+
+
+def main() -> None:
+    try:
+        menu()
+    except KeyboardInterrupt:
+        print("\nInterrupted. Bye!")
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
