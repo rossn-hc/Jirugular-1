@@ -186,3 +186,5 @@ jira_vectors*.jsonl
 jira_vectors*.jsonl
 *.faiss
 jira_vectors.jsonl
+jira_vectors*.jsonl
+*.faiss
