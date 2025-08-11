@@ -11,6 +11,7 @@ Features:
 - Temperature / max_tokens knobs
 - Role-aware base prompts (developer, manager, executive)
 - Backward-compat for `pirate=True`
+- Patricize: when True, model appends one grounded dad joke (localized) at the end
 """
 from __future__ import annotations
 
@@ -56,6 +57,8 @@ class ChatService:
         language: Optional[str] = None,
         # legacy shim
         pirate: Optional[bool] = None,
+        # NEW: ask the model to append a dad joke, grounded in its own answer
+        patricize: bool = False,
     ) -> Dict[str, Any]:
         """
         Retrieve context from FAISS + live Jira fields, construct a robust prompt that
@@ -109,6 +112,19 @@ class ChatService:
 
         if format_lock:
             system_top_lines.append(format_lock)
+
+        # Humor rule: model appends a grounded joke itself (not post-processed)
+        if patricize:
+            humor_rule = (
+                "Humor rule (Patricize): After you finish your complete answer, append exactly one extra line:\n"
+                "PS (Dad joke): <one short, corny, G-rated one-liner>\n"
+                "The joke MUST be based on the content of the answer you just wrote (e.g., statuses, risks, [KEY]s, "
+                "apps/tools mentioned, trends) — not the user's question wording. Keep it to one sentence. "
+                "Do not repeat section headings. If multi-format is enabled, the joke comes after all sections."
+            )
+            system_top_lines.append(humor_rule)
+            if language:
+                system_top_lines.append("Apply the language/locale requirement to the dad joke as well.")
 
         # Your original role/multi-format guidance goes after the hard rules
         system_top_lines.append(role_base)

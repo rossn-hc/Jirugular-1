@@ -4,7 +4,7 @@ interface.py – Headless functions for Jira-RAG logic
 
 Adds persona (character) + role support and preserves backward compatibility
 with the legacy `pirate` flag. Also exposes intensity, temperature, max_tokens,
-and language controls.
+language, multi_format, verbose, and patricize (Dad joke) controls.
 """
 
 from typing import Optional, Dict, Any, List, Union
@@ -55,6 +55,8 @@ def ask_question(
     stem: str = "jira_vectors",
     # Backward-compat: allow legacy callers to pass pirate=True
     pirate: Optional[bool] = None,
+    # NEW: append a corny dad joke at the end
+    patricize: bool = False,
 ) -> Union[Dict[str, Any], str]:
     """
     Load index, initialize ChatService, and return model-generated answer.
@@ -77,7 +79,7 @@ def ask_question(
     client = JiraClient(JIRA_URL, JIRA_USERNAME, JIRA_PASSWORD, verify_ssl=False)
     chat = ChatService(idx, embedder, client)
 
-    # Preferred call signature (character/role/verbose/multi_format + new knobs)
+    # Preferred call signature (pass everything through, including patricize)
     try:
         result = chat.answer(
             question=question,
@@ -90,18 +92,21 @@ def ask_question(
             language=language,
             verbose=verbose,
             multi_format=multi_format,
+            patricize=patricize,
             pirate=None,  # don't send legacy arg when using new signature
         )
     except TypeError as e:
-        # If ChatService is still on the old signature, retry with legacy pirate flag only
+        # If ChatService is still on the old signature, retry with legacy-safe subset
         if "unexpected keyword argument" in str(e):
             legacy_pirate = bool((character or "").strip().lower() == "pirate") or bool(pirate)
             result = chat.answer(
                 question=question,
                 top_k=top_k,
+                role=role,
                 pirate=legacy_pirate,
                 verbose=verbose,
                 multi_format=multi_format,
+                # patricize omitted on legacy path
             )
         else:
             raise
