@@ -1,40 +1,31 @@
 #!/usr/bin/env python
 """
 app_gui.py – Enhanced UI Dialog Box with Chat Window for Jira-RAG
+Adds MS Graph (People) as a separate datasource with its own FAISS stem.
 """
 
 import tkinter as tk
 from tkinter import simpledialog, messagebox, scrolledtext
-from typing import Optional
-from jira_rag.interface import crawl_and_build, show_dependencies, ask_question  # fallback to interface if chat_wrapper isn't in module path
 
+from jira_rag.interface import (
+    crawl_and_build,               # JIRA crawl
+    crawl_msgraph_people,          # MS Graph crawl
+    show_dependencies,
+    ask_question,
+)
 
-PERSONA_OPTIONS = [
-    "",                 # none
-    "pirate",
-    "yoda",
-    "shakespeare",
-    "executive-snark",
-]
-
+# ---------- UI options ----------
+PERSONA_OPTIONS = ["", "pirate", "yoda", "shakespeare", "executive-snark"]
 ROLE_OPTIONS = ["", "developer", "manager", "executive"]
-
 INTENSITY_OPTIONS = ["light", "medium", "heavy"]
-
-LANGUAGE_OPTIONS = [
-    "en",      # English
-    "fr-CA",   # Français (Québec)
-    "fr",      # Français
-    "es",      # Español
-    "de",      # Deutsch
-    "it",      # Italiano
-    "pt-BR",   # Português (Brasil)
-    "ja",      # 日本語
-    "ko",      # 한국어
-    "zh-CN",   # 简体中文
-]
-
+LANGUAGE_OPTIONS = ["en", "fr-CA", "fr", "es", "de", "it", "pt-BR", "ja", "ko", "zh-CN"]
 MAX_TOKEN_OPTIONS = [512, 1024, 2048, 4096]
+
+# Data source -> FAISS stem mapping
+STEMS = {
+    "jira": "jira_vectors",
+    "msgraph": "msgraph_people",
+}
 
 
 class JiraRAGApp:
@@ -46,20 +37,44 @@ class JiraRAGApp:
     def create_main_widgets(self):
         tk.Label(self.root, text="Jira-RAG Interactive", font=('Helvetica', 16, 'bold')).pack(pady=10)
 
-        tk.Button(self.root, text="Crawl / rebuild index", command=self.crawl_index).pack(fill='x', padx=20, pady=5)
-        tk.Button(self.root, text="Open Chat", command=self.open_chat_window).pack(fill='x', padx=20, pady=5)
+        # Crawl buttons
+        btns = tk.Frame(self.root)
+        btns.pack(fill='x', padx=20, pady=5)
+
+        tk.Button(btns, text="Crawl / rebuild JIRA index", command=self.crawl_jira).pack(fill='x', pady=3)
+        tk.Button(btns, text="Crawl / rebuild MS Graph (People) index", command=self.crawl_msgraph).pack(fill='x', pady=3)
+
+        # Chat buttons (open windows bound to specific stem)
+        chats = tk.Frame(self.root)
+        chats.pack(fill='x', padx=20, pady=5)
+        tk.Button(chats, text="Open Chat (JIRA index)", command=lambda: self.open_chat_window("jira")).pack(fill='x', pady=3)
+        tk.Button(chats, text="Open Chat (MS Graph index)", command=lambda: self.open_chat_window("msgraph")).pack(fill='x', pady=3)
+
         tk.Button(self.root, text="Show dependencies for an issue", command=self.dependencies).pack(fill='x', padx=20, pady=5)
         tk.Button(self.root, text="Quit", command=self.root.quit).pack(fill='x', padx=20, pady=5)
 
-    def crawl_index(self):
+    # ----------------- Crawl actions -----------------
+    def crawl_jira(self):
         jql = self.show_jql_builder()
-        if jql is not None:
-            try:
-                crawl_and_build(jql)
-                messagebox.showinfo("Success", f"Crawling completed.\nJQL: {jql}")
-            except Exception as e:
-                messagebox.showerror("Error", f"Crawl failed:\n{e}")
+        if jql is None:
+            return
+        try:
+            crawl_and_build(jql=jql, stem=STEMS["jira"])
+            messagebox.showinfo("Success", f"JIRA crawl completed.\nJQL: {jql}\nStem: {STEMS['jira']}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Crawl failed:\n{e}")
 
+    def crawl_msgraph(self):
+        # You can prompt for 'top' if desired; hardcode small default for PoC
+        try:
+            count = crawl_msgraph_people(stem=STEMS["msgraph"], top=500)
+            messagebox.showinfo("Success", f"MS Graph People crawl completed.\nIndexed: {count} records\nStem: {STEMS['msgraph']}")
+        except AttributeError:
+            messagebox.showerror("Unavailable", "The MS Graph crawl function is not available. Please add it to interface.py.")
+        except Exception as e:
+            messagebox.showerror("Error", f"MS Graph crawl failed:\n{e}")
+
+    # ----------------- JQL builder -----------------
     def show_jql_builder(self):
         popup = tk.Toplevel(self.root)
         popup.title("Advanced JQL Builder")
@@ -115,12 +130,20 @@ class JiraRAGApp:
 
         popup.grab_set()
         self.root.wait_window(popup)
-
         return result.get('jql')
 
-    def open_chat_window(self):
+    # ----------------- Chat window -----------------
+    def open_chat_window(self, datasource: str):
+        """Open a chat window bound to a specific datasource stem."""
+        stem = STEMS.get(datasource, STEMS["jira"])
+
         chat_win = tk.Toplevel(self.root)
-        chat_win.title("Chat Window")
+        title_ds = "JIRA" if datasource == "jira" else "MS Graph (People)"
+        chat_win.title(f"Chat Window – {title_ds}")
+        chat_win.geometry("980x560")
+
+        # Keep stem on the instance
+        chat_win._stem = stem
 
         options_frame = tk.Frame(chat_win)
         options_frame.pack(side=tk.TOP, fill='x', padx=5, pady=5)
@@ -140,21 +163,23 @@ class JiraRAGApp:
         self.persona_var = tk.StringVar(value="")
         tk.OptionMenu(options_frame, self.persona_var, *PERSONA_OPTIONS).grid(row=0, column=5, sticky="w")
 
-        # Verbose + Multi-format
+        # Verbose + Multi-format + Patricize
         self.verbose_var = tk.BooleanVar(value=False)
         self.multiformat_var = tk.BooleanVar(value=False)
+        self.patricize_var = tk.BooleanVar(value=False)
         tk.Checkbutton(options_frame, text="Verbose", variable=self.verbose_var).grid(row=1, column=0, padx=5, pady=(6,0), sticky="w")
         tk.Checkbutton(options_frame, text="Multi-format", variable=self.multiformat_var).grid(row=1, column=1, padx=5, pady=(6,0), sticky="w")
+        tk.Checkbutton(options_frame, text="Patricize (Dad joke)", variable=self.patricize_var).grid(row=1, column=2, padx=(12,5), sticky="w")
 
         # Persona Intensity
-        tk.Label(options_frame, text="Intensity:").grid(row=1, column=2, padx=(12,5), sticky="e")
+        tk.Label(options_frame, text="Intensity:").grid(row=1, column=3, padx=(12,5), sticky="e")
         self.intensity_var = tk.StringVar(value="medium")
-        tk.OptionMenu(options_frame, self.intensity_var, *INTENSITY_OPTIONS).grid(row=1, column=3, sticky="w")
+        tk.OptionMenu(options_frame, self.intensity_var, *INTENSITY_OPTIONS).grid(row=1, column=4, sticky="w")
 
         # Temperature
-        tk.Label(options_frame, text="Temperature:").grid(row=1, column=4, padx=(12,5), sticky="e")
+        tk.Label(options_frame, text="Temperature:").grid(row=1, column=5, padx=(12,5), sticky="e")
         self.temperature_var = tk.DoubleVar(value=0.5)
-        tk.Spinbox(options_frame, from_=0.0, to=1.5, increment=0.1, textvariable=self.temperature_var, width=6).grid(row=1, column=5, sticky="w")
+        tk.Spinbox(options_frame, from_=0.0, to=1.5, increment=0.1, textvariable=self.temperature_var, width=6).grid(row=1, column=6, sticky="w")
 
         # Max tokens
         tk.Label(options_frame, text="Max tokens:").grid(row=2, column=0, padx=(5,5), sticky="w")
@@ -166,14 +191,8 @@ class JiraRAGApp:
         self.language_var = tk.StringVar(value="en")
         tk.OptionMenu(options_frame, self.language_var, *LANGUAGE_OPTIONS).grid(row=2, column=3, sticky="w")
 
-        # NEW: Patricize (Dad joke)
-        self.patricize_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(options_frame, text="Patricize", variable=self.patricize_var).grid(
-            row=2, column=4, padx=(12, 0), pady=(6, 0), sticky="w"
-        )
-
         # Chat display
-        self.chat_display = scrolledtext.ScrolledText(chat_win, state='disabled', height=15)
+        self.chat_display = scrolledtext.ScrolledText(chat_win, state='disabled', height=18)
         self.chat_display.pack(padx=10, pady=5, fill='both', expand=True)
 
         # Entry + Ask button
@@ -182,14 +201,13 @@ class JiraRAGApp:
 
         self.question_entry = tk.Entry(entry_frame)
         self.question_entry.pack(side=tk.LEFT, fill='x', expand=True, padx=(0, 5))
-        tk.Button(entry_frame, text="Ask", command=self.ask_question).pack(side=tk.RIGHT)
+        tk.Button(entry_frame, text="Ask", command=lambda win=chat_win: self.ask_question(win)).pack(side=tk.RIGHT)
 
-    def ask_question(self):
+    def ask_question(self, chat_win):
         question = self.question_entry.get().strip()
         if not question:
             return
 
-        # Clear entry and show question
         self.question_entry.delete(0, tk.END)
         self.chat_display.config(state='normal')
         self.chat_display.insert(tk.END, f"Q: {question}\n")
@@ -204,7 +222,8 @@ class JiraRAGApp:
         language = (self.language_var.get() or "").strip() or None
         verbose = bool(self.verbose_var.get())
         multi_format = bool(self.multiformat_var.get())
-        patricize = bool(self.patricize_var.get())  # NEW
+        patricize = bool(self.patricize_var.get())
+        stem = getattr(chat_win, "_stem", "jira_vectors")
 
         # Try new signature first; on failure, gracefully fall back
         try:
@@ -219,10 +238,11 @@ class JiraRAGApp:
                 language=language,
                 verbose=verbose,
                 multi_format=multi_format,
-                patricize=patricize,  # NEW
+                stem=stem,
+                patricize=patricize,
             )
         except TypeError as e:
-            # If backend doesn't yet accept new args, retry with legacy-safe subset
+            # Fallback to legacy pirate switch
             if "unexpected keyword argument" in str(e):
                 legacy_pirate = (character or "").strip().lower() == "pirate"
                 result = ask_question(
@@ -232,7 +252,7 @@ class JiraRAGApp:
                     pirate=legacy_pirate,
                     verbose=verbose,
                     multi_format=multi_format,
-                    # omit patricize on legacy path
+                    stem=stem,
                 )
             else:
                 result = f"[Error] {e}"
@@ -249,6 +269,7 @@ class JiraRAGApp:
         self.chat_display.config(state='disabled')
         self.chat_display.see(tk.END)
 
+    # ----------------- Misc -----------------
     def dependencies(self):
         key = simpledialog.askstring("Issue Dependencies", "Enter Issue Key (e.g., KSDS-19):")
         if key:

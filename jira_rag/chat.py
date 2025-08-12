@@ -1,15 +1,16 @@
 #!/usr/bin/env python
 """
-chat.py – ChatService that blends semantic recall (FAISS) with live Jira data,
+chat.py – ChatService that blends semantic recall (FAISS) with Jira or MS Graph (people) data,
 with optional verbose mode, expanded metadata context, and enhanced summaries.
 
 Features:
+- Datasource-aware: "jira" (project/issues) vs "people" (MS Graph directory records)
 - Personas via `character` (pirate, yoda, shakespeare, executive-snark, or custom)
 - Persona intensity: light | medium | heavy
 - Multi-format 4-section output with localized headings + hard FORMAT LOCK
 - Language directive first (e.g., "en", "fr-CA", "fr", "es", "de"...)
 - Temperature / max_tokens knobs
-- Role-aware base prompts (developer, manager, executive)
+- Role-aware base prompts (developer, manager, executive) for Jira
 - Backward-compat for `pirate=True`
 - Patricize: when True, model appends one grounded dad joke (localized) at the end
 """
@@ -57,15 +58,21 @@ class ChatService:
         language: Optional[str] = None,
         # legacy shim
         pirate: Optional[bool] = None,
-        # NEW: ask the model to append a dad joke, grounded in its own answer
+        # model appends a grounded dad joke itself
         patricize: bool = False,
+        # "jira" | "people" (msgraph)
+        datasource: str = "jira",
     ) -> Dict[str, Any]:
         """
-        Retrieve context from FAISS + live Jira fields, construct a robust prompt that
-        respects persona/language/formatting, call OpenAI, and return:
-            { "answer": <text>, "sources": <raw_hits>, "structured": <normalized_fields> }
+        Build a datasource-aware prompt, retrieve the right context, call OpenAI,
+        and return {"answer", "sources", "structured"}.
         """
-        # Map legacy pirate flag to new character param if provided
+        # Normalize datasource
+        ds = (datasource or "jira").strip().lower()
+        if ds not in {"jira", "people"}:
+            ds = "jira"
+
+        # Map legacy pirate flag
         if character is None and pirate is not None:
             character = "pirate" if pirate else None
             try:
@@ -73,28 +80,41 @@ class ChatService:
             except Exception:
                 pass
 
-        # ---------------- Retrieval + dedupe ----------------
-        hits = self.retriever.retrieve(question, k=top_k)
+        # ---------------- Retrieval ----------------
+        if ds == "people":
+            # Pure FAISS search; do NOT call Jira APIs
+            q_vec = self.retriever.embedder.encode_one(question)
+            hits = self.retriever.indexer.search(q_vec, k=top_k)
+        else:
+            # Jira path: FAISS + live refresh
+            hits = self.retriever.retrieve(question, k=top_k)
+
+        # ---------------- Dedupe ----------------
         unique_hits: List[Dict[str, Any]] = []
-        seen_keys: set[str] = set()
+        seen: set[str] = set()
         for h in hits:
-            key = h.get("key") or h.get("issue_key")
-            if key and key not in seen_keys:
-                seen_keys.add(key)
+            if ds == "people":
+                # Only Graph /users fields you actually selected (or document)
+                dedupe_key = (
+                    h.get("userPrincipalName")
+                    or h.get("mail")
+                    or h.get("displayName")
+                    or h.get("id")
+                    or h.get("document")
+                )
+            else:
+                dedupe_key = h.get("key") or h.get("issue_key")
+            kstr = str(dedupe_key) if dedupe_key else None
+            if not kstr or kstr not in seen:
+                if kstr:
+                    seen.add(kstr)
                 unique_hits.append(h)
         hits = unique_hits
 
         # ---------------- System prompt stack ----------------
-        # Build role base (includes your original multi_format prompt if enabled)
-        role_base = self._make_system_prompt(multi_format=multi_format, role=role)
-
-        # Language must be FIRST so output is actually localized
         lang_line = self._language_directive(language)
-
-        # Localized format lock if multi_format is on (headings in target lang)
-        format_lock = self._format_lock_text(language) if multi_format else None
-
-        # Persona (with intensity) – told not to mess with headings/order
+        role_base = self._make_system_prompt(multi_format=multi_format, role=role, datasource=ds, language=language)
+        format_lock = self._format_lock_text(language, ds) if multi_format else None
         persona_block = self._persona_instructions(character, intensity=intensity) if character else None
 
         system_top_lines: List[str] = []
@@ -113,20 +133,17 @@ class ChatService:
         if format_lock:
             system_top_lines.append(format_lock)
 
-        # Humor rule: model appends a grounded joke itself (not post-processed)
         if patricize:
             humor_rule = (
                 "Humor rule (Patricize): After you finish your complete answer, append exactly one extra line:\n"
                 "PS (Dad joke): <one short, corny, G-rated one-liner>\n"
-                "The joke MUST be based on the content of the answer you just wrote (e.g., statuses, risks, [KEY]s, "
-                "apps/tools mentioned, trends) — not the user's question wording. Keep it to one sentence. "
-                "Do not repeat section headings. If multi-format is enabled, the joke comes after all sections."
+                "The joke MUST be grounded in the content of the answer you just wrote — not the user's question wording. "
+                "Keep it to one sentence. If multi-format is enabled, the joke comes after all sections."
             )
             system_top_lines.append(humor_rule)
             if language:
                 system_top_lines.append("Apply the language/locale requirement to the dad joke as well.")
 
-        # Your original role/multi-format guidance goes after the hard rules
         system_top_lines.append(role_base)
         system_prompt = "\n\n".join(system_top_lines)
 
@@ -136,7 +153,8 @@ class ChatService:
             question=question,
             hits=hits,
             verbose=verbose,
-            format_lock=format_lock,  # final reminder (if any) right before answering
+            format_lock=format_lock,
+            datasource=ds,
         )
 
         # ---------------- Call OpenAI ----------------
@@ -150,7 +168,6 @@ class ChatService:
                 max_tokens=max_tokens,
             )
         except oai_err.PermissionDeniedError as exc:
-            # Fall back to gpt-4-turbo if requested model isn't accessible
             if "model" in str(exc):
                 try:
                     log.debug("Model %s not available – falling back to gpt-4-turbo", self.model)
@@ -167,48 +184,91 @@ class ChatService:
 
         answer = (resp.choices[0].message.content or "").strip()
 
-        # Persona opener + tag for UI clarity
+        # Persona opener + tag
         if character:
             opener = self._persona_opener(character, intensity=intensity)
             if opener and not answer.startswith(opener):
                 answer = f"{opener} {answer}"
-            # Prefix the persona tag (matches the dropdown value)
-            char_tag = str(character).strip()
-            if char_tag:
-                answer = f"({char_tag}) {answer}"
+            tag = str(character).strip()
+            if tag:
+                answer = f"({tag}) {answer}"
 
         # ---------------- Normalize sources ----------------
-        structured = [
-            {
-                "key": h.get("key"),
-                "issue_type": h.get("issue_type"),
-                "project": h.get("project_key"),
-                "parent": h.get("parent_key"),
-                "assignee": h.get("live_assignee") or h.get("assignee"),
-                "reporter": h.get("reporter"),
-                "priority": h.get("live_priority") or h.get("priority"),
-                "resolution": h.get("resolution"),
-                "status": h.get("live_status") or h.get("status"),
-                "created": h.get("created"),
-                "updated": h.get("live_updated") or h.get("updated"),
-                "labels": h.get("labels", []),
-                "components": h.get("components", []),
-                "fix_versions": h.get("fix_versions", []),
-                "summary": h.get("summary"),
-                "description": (h.get("document") or "").strip(),
-            }
-            for h in hits
-        ]
+        if ds == "people":
+            # Only Graph /users fields you selected (+document)
+            structured = [
+                {
+                    "displayName": h.get("displayName"),
+                    "userPrincipalName": h.get("userPrincipalName") or h.get("mail"),
+                    "mail": h.get("mail"),
+                    "jobTitle": h.get("jobTitle"),
+                    "department": h.get("department"),
+                    "accountEnabled": h.get("accountEnabled"),
+                    "document": (h.get("document") or "").strip(),
+                }
+                for h in hits
+            ]
+        else:
+            structured = [
+                {
+                    "key": h.get("key"),
+                    "issue_type": h.get("issue_type"),
+                    "project": h.get("project_key"),
+                    "parent": h.get("parent_key"),
+                    "assignee": h.get("live_assignee") or h.get("assignee"),
+                    "reporter": h.get("reporter"),
+                    "priority": h.get("live_priority") or h.get("priority"),
+                    "resolution": h.get("resolution"),
+                    "status": h.get("live_status") or h.get("status"),
+                    "created": h.get("created"),
+                    "updated": h.get("live_updated") or h.get("updated"),
+                    "labels": h.get("labels", []),
+                    "components": h.get("components", []),
+                    "fix_versions": h.get("fix_versions", []),
+                    "summary": h.get("summary"),
+                    "description": (h.get("document") or "").strip(),
+                }
+                for h in hits
+            ]
+
         return {"answer": answer, "sources": hits, "structured": structured}
 
     # -------------------------------------------------------------------------
-    # System prompt builders (role-aware & multi-format)
+    # System prompt builders (role-aware & datasource-aware)
     # -------------------------------------------------------------------------
-    def _make_system_prompt(self, multi_format: bool, role: Optional[str] = None) -> str:
+    def _make_system_prompt(
+        self,
+        multi_format: bool,
+        role: Optional[str],
+        datasource: str = "jira",
+        language: Optional[str] = None,
+    ) -> str:
         """
-        Returns the base (role or generic) system prompt.
-        When multi_format=True, returns your original 4-section guidance verbatim.
+        Returns the base system prompt tailored to the datasource.
+        - datasource == "jira": project/issue summaries
+        - datasource == "people": org/people summaries (MS Graph /users)
         """
+        ds = (datasource or "jira").lower()
+
+        if ds == "people":
+            if multi_format:
+                return (
+                    "You are an HR/People analytics assistant summarizing Microsoft 365 directory data (Microsoft Graph /users). "
+                    "Use only the fields provided in context (displayName, userPrincipalName, mail, jobTitle, department, accountEnabled, plus a short document string). "
+                    "Answer plainly about people, roles, and organizational hints. Avoid Jira terminology.\n\n"
+                    "Output must include **four sections**:\n"
+                    "1. **People Overview** – Who is in scope (counts, notable departments/titles, unknowns).\n"
+                    "2. **Managers & Leads (Inferred)** – Based on job titles only (e.g., titles containing 'Manager', 'Lead', 'Director'). Call out uncertainty.\n"
+                    "3. **Org Signals** – Any department or naming patterns that indicate teams or functions.\n"
+                    "4. **Actions & Follow-ups** – Data gaps (missing titles/emails), suggested clarifications.\n"
+                )
+            return (
+                "You are an HR/People analytics assistant summarizing Microsoft Graph /users records. "
+                "Use displayName, userPrincipalName/mail, jobTitle, department, accountEnabled, and the provided notes. "
+                "Answer about people and teams; do not mention Jira."
+            )
+
+        # ---- Jira (default path) ----
         if role == "developer":
             return (
                 "You are a senior Jira-savvy developer. Summarize issues with technical clarity, focusing on code impact, blockers, dependencies, and implementation progress. "
@@ -226,7 +286,6 @@ class ChatService:
             )
 
         if multi_format:
-            # Your original four-section guidance (kept as-is)
             return (
                 "You are a seasoned Jira expert and analyst tasked with generating comprehensive summaries for a cross-functional audience. "
                 "Your goal is to produce verbose, insightful narratives, not lists or field dumps.\n\n"
@@ -238,7 +297,6 @@ class ChatService:
                 "Use [KEY] when referencing issues."
             )
 
-        # Generic (non-multi-format) narrative prompt, also from your original
         return (
             "You are a senior Jira analyst producing detailed summaries. Always write in verbose paragraph style.\n"
             "Start with an overall project-level overview (issue counts, open/closed status).\n"
@@ -255,10 +313,6 @@ class ChatService:
     # Persona & language helpers
     # -------------------------------------------------------------------------
     def _persona_instructions(self, character: Optional[str], intensity: Optional[str] = None) -> str:
-        """
-        Strong persona directive with intensity controls (light/medium/heavy),
-        plus guardrails to avoid corrupting technical details.
-        """
         if not character:
             return ""
         c = character.strip().lower()
@@ -291,14 +345,15 @@ class ChatService:
             ),
         }
 
+        # Make guardrails datasource-agnostic
         base_guardrails = (
-            "General guardrails: Stay truthful to Jira metadata and retrieval context. "
-            "Never invent issue keys or statuses. Do not rename technical fields or labels. "
-            "Preserve [KEY] references, numbers, and dates exactly. If persona conflicts with clarity, prefer clarity."
+            "General guardrails: Stay truthful to the provided metadata and retrieval context. "
+            "Never invent fields or values. Do not rename technical labels. "
+            "Preserve identifiers, numbers, and dates exactly. If persona conflicts with clarity, prefer clarity."
         )
         enforcement = (
             "Enforcement: Each paragraph must visibly exhibit the persona. "
-            "Do not alter code tokens, issue keys, statuses, dates, or numeric values."
+            "Do not alter codes/identifiers, statuses, dates, or numeric values."
         )
         persona = PERSONAS.get(
             c,
@@ -308,7 +363,6 @@ class ChatService:
         return f"{persona} {base_guardrails} {enforcement}"
 
     def _persona_opener(self, character: Optional[str], intensity: Optional[str] = None) -> Optional[str]:
-        """Small opener to immediately set the persona tone at the start of the answer."""
         if not character:
             return None
         key = character.strip().lower()
@@ -330,13 +384,13 @@ class ChatService:
 
     def _language_directive(self, language: Optional[str]) -> Optional[str]:
         """
-        Returns a system instruction to respond in the requested language/locale.
-        Placed FIRST so the model actually switches language.
+        Force all narrative/headings/jokes to the selected language/locale,
+        but KEEP every value from Context (names, titles, depts, keys, UPNs, labels, statuses)
+        exactly as given (no translation/normalization).
         """
         if not language:
             return None
         lang = language.strip()
-        # Friendly aliases
         alias = {
             "english": "en",
             "francais": "fr",
@@ -350,96 +404,59 @@ class ChatService:
             "cn": "zh-CN",
         }
         code = alias.get(lang.lower(), lang)
-        return (
-            "LANGUAGE: Respond entirely in the requested language/locale "
-            f"(use '{code}' conventions). Translate all headings and prose accordingly. "
-            "Do not include English unless quoting issue keys or code."
-        )
 
+        return (
+            "LANGUAGE POLICY:\n"
+            f"- Write ALL explanatory text, section headings, and conclusions in '{code}'.\n"
+            "- DO NOT translate, rewrite, or normalize any literal values coming from the Context block: "
+            "names, job titles, departments, group names, issue keys, statuses, labels, UPNs/emails, IDs, dates. "
+            "Quote them verbatim as data.\n"
+            "- If a value appears in another language/script in Context, leave it as-is. "
+            "Only the surrounding narration/headings should be localized.\n"
+            "- When listing fields, keep their values exactly as given; only the connective prose is localized."
+        )
     # -------------------------------------------------------------------------
     # Multi-format localization
     # -------------------------------------------------------------------------
-    def _localized_headings(self, language: Optional[str]) -> List[str]:
-        """
-        Return localized headings for the four-section format.
-        Fallback: English. Normalizes e.g. 'fr-CA' -> 'fr-ca' -> 'fr'.
-        """
+    def _localized_headings_jira(self, language: Optional[str]) -> List[str]:
         code = (language or "en").lower()
         headings_map: Dict[str, List[str]] = {
-            "en": [
-                "Detailed Summary",
-                "Technical Summary",
-                "Management Summary",
-                "Overall Project Summary",
-            ],
-            "fr": [
-                "Résumé détaillé",
-                "Résumé technique",
-                "Résumé pour la direction",
-                "Résumé global du projet",
-            ],
-            "fr-ca": [
-                "Résumé détaillé",
-                "Résumé technique",
-                "Résumé pour la direction",
-                "Résumé global du projet",
-            ],
-            "es": [
-                "Resumen detallado",
-                "Resumen técnico",
-                "Resumen para la dirección",
-                "Resumen general del proyecto",
-            ],
-            "de": [
-                "Detaillierte Zusammenfassung",
-                "Technische Zusammenfassung",
-                "Management-Zusammenfassung",
-                "Gesamtzusammenfassung des Projekts",
-            ],
-            "it": [
-                "Riepilogo dettagliato",
-                "Riepilogo tecnico",
-                "Riepilogo per la direzione",
-                "Riepilogo complessivo del progetto",
-            ],
-            "pt-br": [
-                "Resumo detalhado",
-                "Resumo técnico",
-                "Resumo para a diretoria",
-                "Resumo geral do projeto",
-            ],
-            "ja": [
-                "詳細サマリー",
-                "技術サマリー",
-                "マネジメントサマリー",
-                "プロジェクト全体のサマリー",
-            ],
-            "ko": [
-                "상세 요약",
-                "기술 요약",
-                "경영 요약",
-                "프로젝트 전반 요약",
-            ],
-            "zh-cn": [
-                "详细摘要",
-                "技术摘要",
-                "管理摘要",
-                "项目总体摘要",
-            ],
+            "en": ["Detailed Summary", "Technical Summary", "Management Summary", "Overall Project Summary"],
+            "fr": ["Résumé détaillé", "Résumé technique", "Résumé pour la direction", "Résumé global du projet"],
+            "fr-ca": ["Résumé détaillé", "Résumé technique", "Résumé pour la direction", "Résumé global du projet"],
+            "es": ["Resumen detallado", "Resumen técnico", "Resumen para la dirección", "Resumen general del proyecto"],
+            "de": ["Detaillierte Zusammenfassung", "Technische Zusammenfassung", "Management-Zusammenfassung", "Gesamtzusammenfassung des Projekts"],
+            "it": ["Riepilogo dettagliato", "Riepilogo tecnico", "Riepilogo per la direzione", "Riepilogo complessivo del progetto"],
+            "pt-br": ["Resumo detalhado", "Resumo técnico", "Resumo para a diretoria", "Resumo geral do projeto"],
+            "ja": ["詳細サマリー", "技術サマリー", "マネジメントサマリー", "プロジェクト全体のサマリー"],
+            "ko": ["상세 요약", "기술 요약", "경영 요약", "프로젝트 전반 요약"],
+            "zh-cn": ["详细摘要", "技术摘要", "管理摘要", "项目总体摘要"],
         }
-        # Normalize region codes: try base language fallback
         if code not in headings_map and "-" in code:
             base = code.split("-")[0]
             if base in headings_map:
                 code = base
         return headings_map.get(code, headings_map["en"])
 
-    def _format_lock_text(self, language: Optional[str]) -> str:
-        """
-        Hard rule for multi-format outputs with headings localized to the target language.
-        This appears TWICE: once at the top, and again right before the user message.
-        """
-        h1, h2, h3, h4 = self._localized_headings(language)
+    def _localized_headings_people(self, language: Optional[str]) -> List[str]:
+        code = (language or "en").lower()
+        headings_map: Dict[str, List[str]] = {
+            "en": ["People Overview", "Managers & Leads (Inferred)", "Org Signals", "Actions & Follow-ups"],
+            "fr": ["Aperçu des personnes", "Gestionnaires et responsables (inférés)", "Signaux d’organisation", "Actions et suivis"],
+            "fr-ca": ["Aperçu des personnes", "Gestionnaires et responsables (inférés)", "Signaux d’organisation", "Actions et suivis"],
+            "es": ["Resumen de personas", "Gerentes y líderes (inferidos)", "Señales de organización", "Acciones y seguimientos"],
+        }
+        if code not in headings_map and "-" in code:
+            base = code.split("-")[0]
+            if base in headings_map:
+                code = base
+        return headings_map.get(code, headings_map["en"])
+
+    def _format_lock_text(self, language: Optional[str], datasource: str) -> str:
+        if (datasource or "jira").lower() == "people":
+            h1, h2, h3, h4 = self._localized_headings_people(language)
+        else:
+            h1, h2, h3, h4 = self._localized_headings_jira(language)
         return (
             "FORMAT LOCK: Produce exactly four sections with these exact headings, in this order:\n"
             f"1. {h1}\n"
@@ -459,6 +476,7 @@ class ChatService:
         hits: List[Dict[str, Any]],
         verbose: bool = False,
         format_lock: Optional[str] = None,
+        datasource: str = "jira",
     ) -> List[Dict[str, str]]:
         """
         Assemble the chat messages in order:
@@ -467,44 +485,63 @@ class ChatService:
           3) system (final format lock reminder, if any)
           4) user (question)
         """
-        # Build context blocks
+        ds = (datasource or "jira").lower()
+
         context_blocks: List[str] = []
         for h in hits:
-            status = h.get("live_status") or h.get("status") or "-"
-            assignee = h.get("live_assignee") or h.get("assignee") or "-"
-            reporter = h.get("reporter") or "-"
-            priority = h.get("live_priority") or h.get("priority") or "-"
-            resolution = h.get("resolution") or "-"
-            created = h.get("created") or "-"
-            updated = h.get("live_updated") or h.get("updated") or "-"
-            labels = ", ".join(h.get("labels", [])) or "-"
-            comps = ", ".join(h.get("components", [])) or "-"
-            fixes = ", ".join(h.get("fix_versions", [])) or "-"
+            if ds == "people":
+                # STRICTLY limit to /users select: displayName, userPrincipalName, mail, jobTitle, department, accountEnabled
+                name = h.get("displayName") or "-"
+                upn = h.get("userPrincipalName") or h.get("mail") or "-"
+                email = h.get("mail") or "-"
+                title = h.get("jobTitle") or "-"
+                dept = h.get("department") or "-"
+                acct = h.get("accountEnabled")
+                acct_str = "Enabled" if acct is True else ("Disabled" if acct is False else "-")
+                doc_text = (h.get("document") or "").strip()
 
-            doc_text = (h.get("document") or "").strip()
-            if not doc_text:
-                # Safe fallback when there's no description text available
-                doc_text = (
-                    f"No description provided for this issue titled '{h.get('summary', 'Untitled')}' "
-                    f"in project {h.get('project_key', '-')}. It is classified as {h.get('issue_type', '-')}, "
-                    f"currently {status}, and was last updated on {updated}."
-                )
-
-            if verbose:
-                block = (
-                    f"[{h['key']}] ({h.get('issue_type', '-')})\n"
-                    f"Project: {h.get('project_key', '-')}"
-                    f" | Assignee: {assignee} | Reporter: {reporter}\n"
-                    f"Status: {status} | Resolution: {resolution} | Priority: {priority}\n"
-                    f"Created: {created} | Updated: {updated}\n"
-                    f"Labels: {labels} | Components: {comps} | Fix Versions: {fixes}\n"
-                    f"Description:\n{doc_text}\n––––––\n"
-                )
+                if verbose:
+                    block = (
+                        f"{name} ({upn})\n"
+                        f"Title: {title} | Department: {dept} | Account: {acct_str} | Email: {email}\n"
+                        f"Notes:\n{(doc_text or '—')}\n––––––\n"
+                    )
+                else:
+                    block = f"{name} – {title}. Dept: {dept}. Email: {email}. UPN: {upn}. Account: {acct_str}."
             else:
-                block = (
-                    f"[{h['key']}] – {h.get('summary', 'No summary')}. "
-                    f"Status: {status}. Assignee: {assignee}. Updated: {updated}."
-                )
+                status = h.get("live_status") or h.get("status") or "-"
+                assignee = h.get("live_assignee") or h.get("assignee") or "-"
+                reporter = h.get("reporter") or "-"
+                priority = h.get("live_priority") or h.get("priority") or "-"
+                resolution = h.get("resolution") or "-"
+                created = h.get("created") or "-"
+                updated = h.get("live_updated") or h.get("updated") or "-"
+                labels = ", ".join(h.get("labels", [])) or "-"
+                comps = ", ".join(h.get("components", [])) or "-"
+                fixes = ", ".join(h.get("fix_versions", [])) or "-"
+                doc_text = (h.get("document") or "").strip()
+                if not doc_text:
+                    doc_text = (
+                        f"No description provided for this issue titled '{h.get('summary', 'Untitled')}' "
+                        f"in project {h.get('project_key', '-')}. It is classified as {h.get('issue_type', '-')}, "
+                        f"currently {status}, and was last updated on {updated}."
+                    )
+
+                if verbose:
+                    block = (
+                        f"[{h.get('key', 'UNKNOWN')}] ({h.get('issue_type', '-')})\n"
+                        f"Project: {h.get('project_key', '-')}"
+                        f" | Assignee: {assignee} | Reporter: {reporter}\n"
+                        f"Status: {status} | Resolution: {resolution} | Priority: {priority}\n"
+                        f"Created: {created} | Updated: {updated}\n"
+                        f"Labels: {labels} | Components: {comps} | Fix Versions: {fixes}\n"
+                        f"Description:\n{doc_text}\n––––––\n"
+                    )
+                else:
+                    block = (
+                        f"[{h.get('key', 'UNKNOWN')}] – {h.get('summary', 'No summary')}. "
+                        f"Status: {status}. Assignee: {assignee}. Updated: {updated}."
+                    )
             context_blocks.append(block)
 
         context_txt = "\n".join(context_blocks)
@@ -514,7 +551,6 @@ class ChatService:
             {"role": "system", "content": f"Context:\n{context_txt}"},
         ]
 
-        # Final format reminder just before answering (helps the model obey headings)
         if format_lock:
             messages.append({"role": "system", "content": format_lock})
 
