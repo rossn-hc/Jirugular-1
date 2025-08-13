@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """
 app_gui.py – Enhanced UI Dialog Box with Chat Window for Jira-RAG
-Adds MS Graph (People) as a separate datasource with its own FAISS stem.
+Adds MS Graph (People) and MS Graph (Sign-ins) as separate datasources with their own FAISS stems.
 """
 
 import tkinter as tk
@@ -9,7 +9,8 @@ from tkinter import simpledialog, messagebox, scrolledtext
 
 from jira_rag.interface import (
     crawl_and_build,               # JIRA crawl
-    crawl_msgraph_people,          # MS Graph crawl
+    crawl_msgraph_people,          # MS Graph People crawl
+    crawl_msgraph_signins,         # MS Graph Sign-ins crawl (NEW)
     show_dependencies,
     ask_question,
 )
@@ -25,6 +26,7 @@ MAX_TOKEN_OPTIONS = [512, 1024, 2048, 4096]
 STEMS = {
     "jira": "jira_vectors",
     "msgraph": "msgraph_people",
+    "signins": "msgraph_signins",   # NEW
 }
 
 
@@ -42,13 +44,15 @@ class JiraRAGApp:
         btns.pack(fill='x', padx=20, pady=5)
 
         tk.Button(btns, text="Crawl / rebuild JIRA index", command=self.crawl_jira).pack(fill='x', pady=3)
-        tk.Button(btns, text="Crawl / rebuild MS Graph (People) index", command=self.crawl_msgraph).pack(fill='x', pady=3)
+        tk.Button(btns, text="Crawl / rebuild MS Graph (People) index", command=self.crawl_msgraph_people).pack(fill='x', pady=3)
+        tk.Button(btns, text="Crawl / rebuild MS Graph (Sign-ins) index", command=self.crawl_msgraph_signins).pack(fill='x', pady=3)  # NEW
 
         # Chat buttons (open windows bound to specific stem)
         chats = tk.Frame(self.root)
         chats.pack(fill='x', padx=20, pady=5)
         tk.Button(chats, text="Open Chat (JIRA index)", command=lambda: self.open_chat_window("jira")).pack(fill='x', pady=3)
-        tk.Button(chats, text="Open Chat (MS Graph index)", command=lambda: self.open_chat_window("msgraph")).pack(fill='x', pady=3)
+        tk.Button(chats, text="Open Chat (MS Graph – People)", command=lambda: self.open_chat_window("msgraph")).pack(fill='x', pady=3)
+        tk.Button(chats, text="Open Chat (MS Graph – Sign-ins)", command=lambda: self.open_chat_window("signins")).pack(fill='x', pady=3)  # NEW
 
         tk.Button(self.root, text="Show dependencies for an issue", command=self.dependencies).pack(fill='x', padx=20, pady=5)
         tk.Button(self.root, text="Quit", command=self.root.quit).pack(fill='x', padx=20, pady=5)
@@ -64,15 +68,44 @@ class JiraRAGApp:
         except Exception as e:
             messagebox.showerror("Error", f"Crawl failed:\n{e}")
 
-    def crawl_msgraph(self):
+    def crawl_msgraph_people(self):
         # You can prompt for 'top' if desired; hardcode small default for PoC
         try:
             count = crawl_msgraph_people(stem=STEMS["msgraph"], top=500)
             messagebox.showinfo("Success", f"MS Graph People crawl completed.\nIndexed: {count} records\nStem: {STEMS['msgraph']}")
         except AttributeError:
-            messagebox.showerror("Unavailable", "The MS Graph crawl function is not available. Please add it to interface.py.")
+            messagebox.showerror("Unavailable", "The MS Graph People crawl function is not available. Please add it to interface.py.")
         except Exception as e:
-            messagebox.showerror("Error", f"MS Graph crawl failed:\n{e}")
+            messagebox.showerror("Error", f"MS Graph People crawl failed:\n{e}")
+
+    def crawl_msgraph_signins(self):
+        """
+        Simple prompts for optional date window and app filter.
+        Accepts YYYY-MM-DD or full ISO (YYYY-MM-DDThh:mm:ssZ). Leaving blank skips the filter.
+        """
+        try:
+            start_date = simpledialog.askstring("Sign-ins Crawl", "Start date (YYYY-MM-DD or ISO), optional:")
+            end_date = simpledialog.askstring("Sign-ins Crawl", "End date (YYYY-MM-DD or ISO), optional:")
+            app_name = simpledialog.askstring("Sign-ins Crawl", "Filter by App Display Name (optional):")
+            # Optional: limit fetch (debugging / PoC)
+            top_s = simpledialog.askstring("Sign-ins Crawl", "Top (limit results; optional integer):")
+            top = int(top_s) if (top_s and top_s.strip().isdigit()) else None
+
+            count = crawl_msgraph_signins(
+                stem=STEMS["signins"],
+                start_date=(start_date or None),
+                end_date=(end_date or None),
+                app_display_name=(app_name or None),
+                top=top,
+            )
+            messagebox.showinfo(
+                "Success",
+                f"MS Graph Sign-ins crawl completed.\nIndexed: {count} records\nStem: {STEMS['signins']}"
+            )
+        except AttributeError:
+            messagebox.showerror("Unavailable", "The MS Graph Sign-ins crawl function is not available. Please add it to interface.py.")
+        except Exception as e:
+            messagebox.showerror("Error", f"MS Graph Sign-ins crawl failed:\n{e}")
 
     # ----------------- JQL builder -----------------
     def show_jql_builder(self):
@@ -138,8 +171,12 @@ class JiraRAGApp:
         stem = STEMS.get(datasource, STEMS["jira"])
 
         chat_win = tk.Toplevel(self.root)
-        title_ds = "JIRA" if datasource == "jira" else "MS Graph (People)"
-        chat_win.title(f"Chat Window – {title_ds}")
+        title_map = {
+            "jira": "JIRA",
+            "msgraph": "MS Graph (People)",
+            "signins": "MS Graph (Sign-ins)",
+        }
+        chat_win.title(f"Chat Window – {title_map.get(datasource, 'JIRA')}")
         chat_win.geometry("980x560")
 
         # Keep stem on the instance
@@ -149,11 +186,11 @@ class JiraRAGApp:
         options_frame.pack(side=tk.TOP, fill='x', padx=5, pady=5)
 
         # Top-K
-        tk.Label(options_frame, text="Number of issues:").grid(row=0, column=0, padx=5, sticky="w")
+        tk.Label(options_frame, text="Top-K:").grid(row=0, column=0, padx=5, sticky="w")
         self.top_k_var = tk.IntVar(value=5)
         tk.Spinbox(options_frame, from_=1, to=100, textvariable=self.top_k_var, width=6).grid(row=0, column=1, sticky="w")
 
-        # Role dropdown
+        # Role dropdown (used for Jira; harmless for others)
         tk.Label(options_frame, text="Role:").grid(row=0, column=2, padx=(12, 5), sticky="e")
         self.role_var = tk.StringVar(value="")
         tk.OptionMenu(options_frame, self.role_var, *ROLE_OPTIONS).grid(row=0, column=3, sticky="w")

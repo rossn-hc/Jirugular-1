@@ -17,7 +17,8 @@ from __future__ import annotations
 import itertools
 import logging
 import sys
-from typing import Any, Dict, Iterator, List, Sequence
+from typing import Any, Optional
+from collections.abc import Sequence, Iterator
 
 import requests
 from requests.auth import HTTPBasicAuth
@@ -81,31 +82,46 @@ class JiraClient:  # pylint: disable=too-few-public-methods
 
     def search(
         self,
-        jql: str,
+        jql: Optional[str],
         *,
-        fields: Sequence[str] | None = None,
+        fields: Optional[Sequence[str]] = None,
         batch: int = 200,
-        expand: str | None = None,
+        expand: Optional[str] = None,
     ) -> Iterator[dict[str, Any]]:
-        """Yield every issue matching *JQL*, transparently handling pagination."""
+        """
+        Yield every issue matching *JQL*, transparently handling pagination.
+        If JQL is blank/None, use a safe 'match all' sort: ORDER BY updated DESC.
+        Raises a clear error on 401/403.
+        """
+        effective_jql = (jql or "").strip() or "ORDER BY updated DESC"
 
         start_at = 0
         total = sys.maxsize
         while start_at < total:
-            params = {
-                "jql": jql,
+            params: dict[str, Any] = {
+                "jql": effective_jql,
                 "startAt": start_at,
-                "maxResults": batch,
+                "maxResults": min(int(batch), 1000),  # Jira caps page size at 1000
             }
             if fields:
                 params["fields"] = ",".join(fields)
             if expand:
                 params["expand"] = expand
 
+            # use your existing low-level GET; add auth guard
             page: dict[str, Any] = self._get(self.SEARCH_ENDPOINT, **params)
-            total = page.get("total", 0)
-            issues: list[Any] = page.get("issues", [])
-            log.debug("Fetched %s/%s issues (batch=%s)", start_at + len(issues), total, batch)
+            if isinstance(page, str):  # defensive: some servers return HTML on 403
+                raise RuntimeError(
+                    f"Jira search failed (possible 401/403). JQL='{effective_jql}'. "
+                    f"Response (first 300 chars): {page[:300]}"
+                )
+
+            total = int(page.get("total", 0))
+            issues: list[Any] = page.get("issues", []) or []
+            log.debug("Fetched %s/%s issues (batch=%s)", start_at + len(issues), total, params["maxResults"])
+
+            if not issues:
+                break
 
             yield from issues
             start_at += len(issues)

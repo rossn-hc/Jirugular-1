@@ -1,10 +1,10 @@
 #!/usr/bin/env python
 """
-chat.py – ChatService that blends semantic recall (FAISS) with Jira or MS Graph (people) data,
+chat.py – ChatService that blends semantic recall (FAISS) with Jira, MS Graph People, and MS Graph Sign-ins data,
 with optional verbose mode, expanded metadata context, and enhanced summaries.
 
 Features:
-- Datasource-aware: "jira" (project/issues) vs "people" (MS Graph directory records)
+- Datasource-aware: "jira" (project/issues) vs "people" (MS Graph /users) vs "signins" (MS Graph /auditLogs/signIns)
 - Personas via `character` (pirate, yoda, shakespeare, executive-snark, or custom)
 - Persona intensity: light | medium | heavy
 - Multi-format 4-section output with localized headings + hard FORMAT LOCK
@@ -41,6 +41,16 @@ class ChatService:
         self.model = model or CHAT_MODEL or "gpt-4-turbo"
         self.retriever = HybridRetriever(indexer, embedder, jira)
 
+    # ---------------- NEW: persona normalizer ----------------
+    def _normalize_persona(self, character: Optional[str]) -> Optional[str]:
+        """Normalize UI-provided persona; treat 'Default', 'None', etc. as no persona."""
+        if character is None:
+            return None
+        s = str(character).strip().lower()
+        if s in {"", "none", "default", "off", "no"}:
+            return None
+        return s
+
     # -------------------------------------------------------------------------
     # Public API
     # -------------------------------------------------------------------------
@@ -60,7 +70,7 @@ class ChatService:
         pirate: Optional[bool] = None,
         # model appends a grounded dad joke itself
         patricize: bool = False,
-        # "jira" | "people" (msgraph)
+        # "jira" | "people" (msgraph) | "signins" (msgraph audit logs)  # --- SIGNINS ---
         datasource: str = "jira",
     ) -> Dict[str, Any]:
         """
@@ -69,19 +79,27 @@ class ChatService:
         """
         # Normalize datasource
         ds = (datasource or "jira").strip().lower()
-        if ds not in {"jira", "people"}:
+        if ds not in {"jira", "people", "signins"}:  # --- SIGNINS ---
             ds = "jira"
 
-        # Map legacy pirate flag
+        # Legacy pirate -> character; then normalize persona & intensity (NEW)
         if character is None and pirate is not None:
             character = "pirate" if pirate else None
             try:
                 log.debug("Deprecated arg 'pirate' used; mapped to character=%r", character)
             except Exception:
                 pass
+        character = self._normalize_persona(character)
+
+        lvl = (intensity or "medium").strip().lower()
+        if lvl not in {"light", "medium", "heavy"}:
+            lvl = "medium"
+        # Stronger style adherence for Yoda in multi-format
+        if character == "yoda" and multi_format and lvl == "medium":
+            lvl = "heavy"
 
         # ---------------- Retrieval ----------------
-        if ds == "people":
+        if ds in {"people", "signins"}:  # --- SIGNINS ---
             # Pure FAISS search; do NOT call Jira APIs
             q_vec = self.retriever.embedder.encode_one(question)
             hits = self.retriever.indexer.search(q_vec, k=top_k)
@@ -94,12 +112,17 @@ class ChatService:
         seen: set[str] = set()
         for h in hits:
             if ds == "people":
-                # Only Graph /users fields you actually selected (or document)
                 dedupe_key = (
                     h.get("userPrincipalName")
                     or h.get("mail")
                     or h.get("displayName")
                     or h.get("id")
+                    or h.get("document")
+                )
+            elif ds == "signins":  # --- SIGNINS ---
+                dedupe_key = (
+                    h.get("id")
+                    or f"{h.get('userPrincipalName')}|{h.get('createdDateTime')}|{h.get('appDisplayName')}"
                     or h.get("document")
                 )
             else:
@@ -115,7 +138,7 @@ class ChatService:
         lang_line = self._language_directive(language)
         role_base = self._make_system_prompt(multi_format=multi_format, role=role, datasource=ds, language=language)
         format_lock = self._format_lock_text(language, ds) if multi_format else None
-        persona_block = self._persona_instructions(character, intensity=intensity) if character else None
+        persona_block = self._persona_instructions(character, intensity=lvl) if character else None
 
         system_top_lines: List[str] = []
         if lang_line:
@@ -147,6 +170,17 @@ class ChatService:
         system_top_lines.append(role_base)
         system_prompt = "\n\n".join(system_top_lines)
 
+        # ---------------- NEW: persona reminder just-in-time ----------------
+        persona_reminder = None
+        if character:
+            persona_reminder = (
+                "Persona enforcement:\n"
+                "- Apply the requested persona consistently in EVERY paragraph.\n"
+                "- Meet the per-paragraph quota described above (e.g., Yoda inversion count).\n"
+                "- If any paragraph fails the quota, rewrite that paragraph before finalizing.\n"
+                "- Keep section headings and all data values exactly as given."
+            )
+
         # ---------------- Build messages ----------------
         messages = self._build_prompt(
             system_prompt=system_prompt,
@@ -155,10 +189,15 @@ class ChatService:
             verbose=verbose,
             format_lock=format_lock,
             datasource=ds,
+            persona_reminder=persona_reminder,  # NEW
         )
 
         # ---------------- Call OpenAI ----------------
-        temperature = 0.5 if temperature is None else float(temperature)
+        base_temp = 0.5 if temperature is None else float(temperature)
+        if character:
+            # Lower temp helps stick to style rules; don't go below 0.2
+            base_temp = min(base_temp, 0.35)
+        temperature = base_temp
         max_tokens = 4096 if max_tokens is None else int(max_tokens)
         try:
             resp = self.client.chat.completions.create(
@@ -186,7 +225,7 @@ class ChatService:
 
         # Persona opener + tag
         if character:
-            opener = self._persona_opener(character, intensity=intensity)
+            opener = self._persona_opener(character, intensity=lvl)
             if opener and not answer.startswith(opener):
                 answer = f"{opener} {answer}"
             tag = str(character).strip()
@@ -195,7 +234,6 @@ class ChatService:
 
         # ---------------- Normalize sources ----------------
         if ds == "people":
-            # Only Graph /users fields you selected (+document)
             structured = [
                 {
                     "displayName": h.get("displayName"),
@@ -204,6 +242,25 @@ class ChatService:
                     "jobTitle": h.get("jobTitle"),
                     "department": h.get("department"),
                     "accountEnabled": h.get("accountEnabled"),
+                    "document": (h.get("document") or "").strip(),
+                }
+                for h in hits
+            ]
+        elif ds == "signins":  # --- SIGNINS ---
+            structured = [
+                {
+                    "id": h.get("id"),
+                    "createdDateTime": h.get("createdDateTime"),
+                    "appDisplayName": h.get("appDisplayName"),
+                    "userDisplayName": h.get("userDisplayName"),
+                    "userPrincipalName": h.get("userPrincipalName"),
+                    "ipAddress": h.get("ipAddress"),
+                    "clientAppUsed": h.get("clientAppUsed"),
+                    "operatingSystem": h.get("operatingSystem"),
+                    "browser": h.get("browser"),
+                    "city": h.get("city"),
+                    "countryOrRegion": h.get("countryOrRegion"),
+                    "result": h.get("result"),
                     "document": (h.get("document") or "").strip(),
                 }
                 for h in hits
@@ -247,6 +304,7 @@ class ChatService:
         Returns the base system prompt tailored to the datasource.
         - datasource == "jira": project/issue summaries
         - datasource == "people": org/people summaries (MS Graph /users)
+        - datasource == "signins": auth activity summaries (MS Graph /auditLogs/signIns)
         """
         ds = (datasource or "jira").lower()
 
@@ -266,6 +324,23 @@ class ChatService:
                 "You are an HR/People analytics assistant summarizing Microsoft Graph /users records. "
                 "Use displayName, userPrincipalName/mail, jobTitle, department, accountEnabled, and the provided notes. "
                 "Answer about people and teams; do not mention Jira."
+            )
+
+        if ds == "signins":  # --- SIGNINS ---
+            if multi_format:
+                return (
+                    "You are a security ops analyst summarizing Microsoft Graph Audit Logs sign-in events (/auditLogs/signIns). "
+                    "Use only the fields in context (createdDateTime, appDisplayName, userDisplayName, userPrincipalName, ipAddress, clientAppUsed, operatingSystem, browser, city, countryOrRegion, result) plus the provided document text. "
+                    "Identify failure patterns, risky geographies/devices, and actionable follow-ups.\n\n"
+                    "Output must include **four sections**:\n"
+                    "1. **Auth Activity Overview** – Volume, time window implied by the context, notable apps/users.\n"
+                    "2. **Failures & Risk Signals** – Error trends, repeated failures, impossible travel hints, suspicious IP/device patterns.\n"
+                    "3. **Geo & Device Patterns** – Cities/countries, OS/browser clusters, client app usage anomalies.\n"
+                    "4. **Actions & Queries** – Concrete next steps (KQL/MS Graph filters, MFA checks, conditional access review).\n"
+                )
+            return (
+                "You are a security ops analyst summarizing Microsoft Graph Audit Logs sign-in events. "
+                "Focus on failures, anomalies, and practical next steps. Keep findings concise and actionable."
             )
 
         # ---- Jira (default path) ----
@@ -320,47 +395,59 @@ class ChatService:
         if lvl not in {"light", "medium", "heavy"}:
             lvl = "medium"
 
-        freq = {"light": "at least one", "medium": "at least two", "heavy": "most"}[lvl]
-        yoda_freq = {"light": "at least one", "medium": "at least two", "heavy": "the majority of"}[lvl]
-        pirate_freq = {"light": "1", "medium": "1–2", "heavy": "2–3"}[lvl]
+        # Quantitative per-paragraph quotas
+        yoda_quota = {"light": 1, "medium": 2, "heavy": 3}[lvl]
+        pirate_quota = {"light": 1, "medium": 2, "heavy": 3}[lvl]
+        shakespeare_quota = {"light": 1, "medium": 2, "heavy": 3}[lvl]
+        execsnark_quota = {"light": 1, "medium": 2, "heavy": 3}[lvl]
+
+        # Global style rules boost consistency
+        global_rules = (
+            "Style rules:\n"
+            "- Keep average sentence length under ~18 words (concise).\n"
+            "- Prefer simple clauses over compound, to maintain tone.\n"
+            "- Avoid generic corporate phrasing.\n"
+        )
 
         PERSONAS: Dict[str, str] = {
             "pirate": (
-                "Persona: Classic sea pirate. Use nautical slang and occasional 'Arrr'. "
-                f"Voice guidance: {pirate_freq} pirate-flavored phrases per paragraph; do not overdo it."
+                "Persona: Classic sea pirate.\n"
+                f"- Quota: include ≥{pirate_quota} pirate-flavored phrases per paragraph (nautical slang, 'Arrr').\n"
+                "- Maintain clarity; never obscure identifiers.\n"
             ),
             "yoda": (
-                "Persona: Yoda. Frequently use inverted syntax (object before subject/verb), omit articles at times, "
-                "and sprinkle brief interjections ('Hmm.', 'Hrrrm.', 'Yes.'). "
-                f"Voice guidance: In EVERY paragraph, {yoda_freq} sentences must use Yoda-style inversion. "
-                "Avoid corporate boilerplate phrasing. Be short, wise, and direct."
+                "Persona: Yoda.\n"
+                "- Use inverted syntax frequently (object before subject/verb) and brief interjections ('Hmm.', 'Hrrrm.', 'Yes.').\n"
+                f"- Quota: include ≥{yoda_quota} Yoda-style **inverted** sentences per paragraph.\n"
+                "- Example templates: 'Open the issue remains.'  'At risk, this project is.'  'Blocked by X, the team is.'\n"
             ),
             "shakespeare": (
-                "Persona: Elizabethan/Shakespearean. Slightly archaic diction ('thee', 'thou', 'hath') and rhythmic flourish. "
-                f"Voice guidance: Include {freq} light flourishes per paragraph; keep business terms intact."
+                "Persona: Elizabethan/Shakespearean.\n"
+                f"- Quota: include ≥{shakespeare_quota} light Elizabethan flourishes per paragraph.\n"
             ),
             "executive-snark": (
-                "Persona: Executive with dry wit. Brief, incisive, slightly sardonic, but professional. "
-                f"Voice guidance: Include {freq} pointed, wry sentences per paragraph; never disrespectful."
+                "Persona: Executive with dry wit.\n"
+                f"- Quota: include ≥{execsnark_quota} wry, incisive lines per paragraph.\n"
+                "- Keep it professional; never disrespectful.\n"
             ),
         }
 
-        # Make guardrails datasource-agnostic
         base_guardrails = (
-            "General guardrails: Stay truthful to the provided metadata and retrieval context. "
-            "Never invent fields or values. Do not rename technical labels. "
-            "Preserve identifiers, numbers, and dates exactly. If persona conflicts with clarity, prefer clarity."
+            "Truthfulness & data rules:\n"
+            "- Stay strictly grounded in provided context.\n"
+            "- Do not invent fields or values; preserve identifiers, numbers, statuses, and dates exactly.\n"
+            "- If persona conflicts with clarity, prefer clarity but still meet the quota.\n"
         )
         enforcement = (
-            "Enforcement: Each paragraph must visibly exhibit the persona. "
-            "Do not alter codes/identifiers, statuses, dates, or numeric values."
+            "Self-check:\n"
+            "- For EACH paragraph, verify the quota is met; if not, rewrite that paragraph before finalizing.\n"
         )
         persona = PERSONAS.get(
             c,
-            f"Persona: {character}. Adopt a consistent, recognizable voice matching this persona. "
-            f"Voice guidance: Ensure {freq} sentence(s) per paragraph reflect the requested style.",
+            f"Persona: {character}. Maintain a consistent, recognizable voice in every paragraph. "
+            f"Quota: include ≥{ {'light':1,'medium':2,'heavy':3}[lvl] } persona-typical sentences per paragraph.\n"
         )
-        return f"{persona} {base_guardrails} {enforcement}"
+        return f"{persona}\n{global_rules}{base_guardrails}{enforcement}"
 
     def _persona_opener(self, character: Optional[str], intensity: Optional[str] = None) -> Optional[str]:
         if not character:
@@ -415,6 +502,7 @@ class ChatService:
             "Only the surrounding narration/headings should be localized.\n"
             "- When listing fields, keep their values exactly as given; only the connective prose is localized."
         )
+
     # -------------------------------------------------------------------------
     # Multi-format localization
     # -------------------------------------------------------------------------
@@ -452,9 +540,26 @@ class ChatService:
                 code = base
         return headings_map.get(code, headings_map["en"])
 
+    def _localized_headings_signins(self, language: Optional[str]) -> List[str]:  # --- SIGNINS ---
+        code = (language or "en").lower()
+        headings_map: Dict[str, List[str]] = {
+            "en": ["Auth Activity Overview", "Failures & Risk Signals", "Geo & Device Patterns", "Actions & Queries"],
+            "fr": ["Aperçu de l’activité d’authentification", "Échecs et signaux de risque", "Schémas géo et appareils", "Actions et requêtes"],
+            "fr-ca": ["Aperçu de l’activité d’authentification", "Échecs et signaux de risque", "Schémas géo et appareils", "Actions et requêtes"],
+            "es": ["Resumen de actividad de autenticación", "Fallos y señales de riesgo", "Patrones geográficos y de dispositivos", "Acciones y consultas"],
+        }
+        if code not in headings_map and "-" in code:
+            base = code.split("-")[0]
+            if base in headings_map:
+                code = base
+        return headings_map.get(code, headings_map["en"])
+
     def _format_lock_text(self, language: Optional[str], datasource: str) -> str:
-        if (datasource or "jira").lower() == "people":
+        ds = (datasource or "jira").lower()
+        if ds == "people":
             h1, h2, h3, h4 = self._localized_headings_people(language)
+        elif ds == "signins":  # --- SIGNINS ---
+            h1, h2, h3, h4 = self._localized_headings_signins(language)
         else:
             h1, h2, h3, h4 = self._localized_headings_jira(language)
         return (
@@ -477,6 +582,7 @@ class ChatService:
         verbose: bool = False,
         format_lock: Optional[str] = None,
         datasource: str = "jira",
+        persona_reminder: Optional[str] = None,  # NEW
     ) -> List[Dict[str, str]]:
         """
         Assemble the chat messages in order:
@@ -490,7 +596,6 @@ class ChatService:
         context_blocks: List[str] = []
         for h in hits:
             if ds == "people":
-                # STRICTLY limit to /users select: displayName, userPrincipalName, mail, jobTitle, department, accountEnabled
                 name = h.get("displayName") or "-"
                 upn = h.get("userPrincipalName") or h.get("mail") or "-"
                 email = h.get("mail") or "-"
@@ -508,6 +613,33 @@ class ChatService:
                     )
                 else:
                     block = f"{name} – {title}. Dept: {dept}. Email: {email}. UPN: {upn}. Account: {acct_str}."
+            elif ds == "signins":  # --- SIGNINS ---
+                when = h.get("createdDateTime") or "-"
+                app = h.get("appDisplayName") or "-"
+                uname = h.get("userDisplayName") or "-"
+                upn = h.get("userPrincipalName") or "-"
+                ip = h.get("ipAddress") or "-"
+                cap = h.get("clientAppUsed") or "-"
+                osn = h.get("operatingSystem") or "-"
+                brw = h.get("browser") or "-"
+                city = h.get("city") or "-"
+                country = h.get("countryOrRegion") or "-"
+                result = h.get("result") or "-"
+                doc_text = (h.get("document") or "").strip()
+
+                if verbose:
+                    block = (
+                        f"{when} | {app}\n"
+                        f"User: {uname} ({upn}) | Result: {result}\n"
+                        f"IP: {ip} | Client: {cap} | OS: {osn} | Browser: {brw}\n"
+                        f"Location: {city}, {country}\n"
+                        f"Notes:\n{(doc_text or '—')}\n––––––\n"
+                    )
+                else:
+                    block = (
+                        f"{when} – {app}. {uname} ({upn}). Result: {result}. "
+                        f"IP {ip}. {city}, {country}. Client {cap}. OS {osn}. Browser {brw}."
+                    )
             else:
                 status = h.get("live_status") or h.get("status") or "-"
                 assignee = h.get("live_assignee") or h.get("assignee") or "-"
@@ -553,6 +685,9 @@ class ChatService:
 
         if format_lock:
             messages.append({"role": "system", "content": format_lock})
+
+        if persona_reminder:
+            messages.append({"role": "system", "content": persona_reminder})
 
         messages.append({"role": "user", "content": question})
         return messages
