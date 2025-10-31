@@ -8,11 +8,11 @@ import tkinter as tk
 from tkinter import simpledialog, messagebox, scrolledtext
 
 from jira_rag.interface import (
-    crawl_and_build,               # JIRA crawl
-    crawl_msgraph_people,          # MS Graph People crawl
-    crawl_msgraph_signins,         # MS Graph Sign-ins crawl (NEW)
+    crawl_and_build,        # JIRA crawl
+    crawl_msgraph_people,   # MS Graph People crawl
+    crawl_msgraph_signins,  # MS Graph Sign-ins crawl (NEW)
     show_dependencies,
-    ask_question,
+    ask_question
 )
 
 # ---------- UI options ----------

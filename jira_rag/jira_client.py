@@ -17,8 +17,9 @@ from __future__ import annotations
 import itertools
 import logging
 import sys
-from typing import Any, Optional
+from typing import Any, Optional, List
 from collections.abc import Sequence, Iterator
+from dataclasses import dataclass
 
 import requests
 from requests.auth import HTTPBasicAuth
@@ -32,32 +33,49 @@ from tenacity import (
 log = logging.getLogger(__name__)
 
 
+@dataclass
+class JiraConfig:
+    """Configuration for Jira client.
+
+    Either token OR (username, password) must be provided for authentication.
+    """
+
+    base_url: str
+    username: str | None = None
+    password: str | None = None
+    token: str | None = None
+    verify_ssl: bool = True
+    timeout: int = 30
+
+
 class JiraClient:  # pylint: disable=too-few-public-methods
     """Minimal Jira REST v2 helper.
 
     Parameters
     ----------
-    base_url : str
-        Base URL to your Jira instance, e.g. ``https://jira.example.com/jira``.
-    username, password : str
-        Basic‑auth credentials (or token as *password*).
-    verify_ssl : bool, default True
-        Set to False to skip TLS verification (self‑signed certs, etc.).
-    timeout : int, default 30
-        Per‑request timeout in seconds.
+    config : JiraConfig
+        Configuration object containing connection parameters
     """
 
     SEARCH_ENDPOINT = "rest/api/2/search"
     ISSUE_ENDPOINT = "rest/api/2/issue/{key}"
 
-    def __init__(self, base_url: str, username: str, password: str, *, verify_ssl: bool = True, timeout: int = 30):
-        self.base_url = base_url.rstrip("/")
-        self.timeout = timeout
+    def __init__(self, config: JiraConfig):
+        self.base_url = config.base_url.rstrip("/")
+        self.timeout = config.timeout
 
         sess = requests.Session()
-        sess.auth = HTTPBasicAuth(username, password)
+        if config.token:
+            if config.username or config.password:
+                raise ValueError("Cannot use both token and username/password authentication")
+            sess.headers.update({"Authorization": f"Bearer {config.token}"})
+        elif config.username and config.password:
+            sess.auth = HTTPBasicAuth(config.username, config.password)
+        else:
+            raise ValueError("Either token or both username and password must be provided")
+
         sess.headers.update({"Content-Type": "application/json"})
-        sess.verify = verify_ssl
+        sess.verify = config.verify_ssl
         self.session = sess
 
     # ------------------------------------------------------------------
@@ -167,4 +185,4 @@ class JiraClient:  # pylint: disable=too-few-public-methods
         return results
 
 
-__all__ = ["JiraClient"]
+__all__ = ["JiraClient", "JiraConfig"]

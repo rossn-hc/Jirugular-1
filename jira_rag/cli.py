@@ -10,10 +10,10 @@ import logging
 from pathlib import Path
 from typing import List
 
-from .config import JIRA_PASSWORD, JIRA_URL, JIRA_USERNAME
+from .config import JIRA_PASSWORD, JIRA_URL, JIRA_USERNAME, JIRA_TOKEN
 from .crawler import JiraCrawler
 from .embedder import Embedder
-from .jira_client import JiraClient
+from .jira_client import JiraClient, JiraConfig
 from .vector_store import FaissIndexer
 from .chat import ChatService
 from .models import IssueNode
@@ -55,7 +55,22 @@ def main() -> None:
     indexer = FaissIndexer(dim=embedder.dim)
 
     if args.cmd == "crawl":
-        client = JiraClient(JIRA_URL, JIRA_USERNAME, JIRA_PASSWORD, verify_ssl=False)
+        # Create config based on available credentials
+        if JIRA_TOKEN:
+            config = JiraConfig(
+                base_url=JIRA_URL,
+                token=JIRA_TOKEN,
+                verify_ssl=False
+            )
+        else:
+            config = JiraConfig(
+                base_url=JIRA_URL,
+                username=JIRA_USERNAME,
+                password=JIRA_PASSWORD,
+                verify_ssl=False
+            )
+        
+        client = JiraClient(config)
         crawler = JiraCrawler(client)
         nodes = crawler.crawl(jql_scope=args.jql)
         _save_raw(nodes, Path(args.raw))

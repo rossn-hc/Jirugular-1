@@ -6,7 +6,14 @@ import os
 import sys
 from pathlib import Path
 
-from dotenv import load_dotenv
+# Optional: load a .env file if python-dotenv is installed (silently skip if not)
+try:
+    from dotenv import load_dotenv  # type: ignore
+    env_path = Path(__file__).parent.parent / ".env"
+    if env_path.exists():
+        load_dotenv(dotenv_path=env_path)
+except Exception:
+    pass
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("openai").setLevel(logging.WARNING)
@@ -23,6 +30,7 @@ load_dotenv(BASE_DIR / ".env")  # falls back gracefully if .env is missing
 JIRA_URL: str = os.getenv("JIRA_URL", "")
 JIRA_USERNAME: str = os.getenv("JIRA_USERNAME", "")
 JIRA_PASSWORD: str = os.getenv("JIRA_PASSWORD", "")
+JIRA_TOKEN: str = os.getenv("JIRA_TOKEN", "")
 
 OPENAI_API_KEY: str | None = os.getenv("OPENAI_API_KEY")
 CHAT_MODEL: str = os.getenv("CHAT_MODEL", "gpt-3.5-turbo")

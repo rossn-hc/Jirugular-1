@@ -22,7 +22,7 @@ from .embedder import Embedder
 from .vector_store import FaissIndexer
 from .chat import ChatService
 from . import config as cfg
-from .jira_client import JiraClient
+from .jira_client import JiraClient, JiraConfig
 
 # Optional: MS Graph People crawler (provided in msgraph_crawler.py)
 try:
@@ -92,12 +92,25 @@ def crawl_and_build(jql: str = "", stem: str = "jira_vectors") -> None:
     """Fetch issues using JQL, embed them, and build the vector index (Jira)."""
     effective_jql = (jql or "").strip() or "ORDER BY updated DESC"
 
-    client = JiraClient(
-        cfg.JIRA_URL,
-        cfg.JIRA_USERNAME,
-        cfg.JIRA_PASSWORD,
-        verify_ssl=False,
-    )
+    # Choose either token OR username/password auth
+    if (cfg.JIRA_TOKEN or "").strip():
+        jc = JiraConfig(
+            base_url=(cfg.JIRA_URL or "").strip(),
+            token=(cfg.JIRA_TOKEN or "").strip(),
+            verify_ssl=False
+        )
+    else:
+        jc = JiraConfig(
+            base_url=(cfg.JIRA_URL or "").strip(),
+            username=(cfg.JIRA_USERNAME or "").strip(),
+            password=(cfg.JIRA_PASSWORD or "").strip(),
+            verify_ssl=False
+        )
+
+    if not (jc.token or (jc.username and jc.password)):
+        raise RuntimeError("Jira credentials not configured. Set either JIRA_TOKEN or both JIRA_USERNAME and JIRA_PASSWORD.")
+
+    client = JiraClient(jc)
 
     embedder = Embedder()
     index = FaissIndexer(dim=embedder.dim, stem=stem)
@@ -294,7 +307,28 @@ def ask_question(
         return f"Index not found for stem '{stem}'. Run crawl first."
 
     # Jira client only for Jira datasource; pass None otherwise (HybridRetriever should handle it)
-    jira_client = JiraClient(cfg.JIRA_URL, cfg.JIRA_USERNAME, cfg.JIRA_PASSWORD, verify_ssl=False) if ds == "jira" else None
+    if ds == "jira":
+        # Same auth logic as crawl_and_build
+        if (cfg.JIRA_TOKEN or "").strip():
+            jc = JiraConfig(
+                base_url=(cfg.JIRA_URL or "").strip(),
+                token=(cfg.JIRA_TOKEN or "").strip(),
+                verify_ssl=False
+            )
+        else:
+            jc = JiraConfig(
+                base_url=(cfg.JIRA_URL or "").strip(),
+                username=(cfg.JIRA_USERNAME or "").strip(),
+                password=(cfg.JIRA_PASSWORD or "").strip(),
+                verify_ssl=False
+            )
+
+        if not (jc.token or (jc.username and jc.password)):
+            return "Jira credentials missing. Set either JIRA_TOKEN or both JIRA_USERNAME and JIRA_PASSWORD."
+            
+        jira_client = JiraClient(jc)
+    else:
+        jira_client = None
     chat = ChatService(idx, embedder, jira_client)
 
     try:
